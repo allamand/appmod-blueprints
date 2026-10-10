@@ -3,7 +3,7 @@ kind: Template
 metadata:
   description: Deploy a Kro-based CI/CD Pipeline using GitOps with ArgoCD
   name: cicd-pipeline-gitops
-  title: Deploy CI/CD Pipeline With kro (GitOps)
+  title: Deploy CI/CD Pipeline (GitOps)
 spec:
   owner: guest
   type: service
@@ -88,11 +88,12 @@ spec:
           aws_region: ${{ parameters.aws_region }}
           aws_account_id: ${{ steps['fetchSystem'].output.entity.spec.aws_account_id }}
           gitlab_hostname: ${{ steps['fetchSystem'].output.entity.spec.gitlab_hostname }}
+          insecure: ${{ steps['fetchSystem'].output.entity.spec.insecure | default(true) }}
           argocd_hostname: ${{ steps['fetchSystem'].output.entity.spec.argocd_hostname }}
           ingress_hostname: ${{ steps['fetchSystem'].output.entity.spec.ingress_hostname }}
           git_username: ${{ steps['fetchSystem'].output.entity.spec.gituser }}
           cluster_name: ${{ steps['fetchSystem'].output.entity.spec.hub_cluster_name }}
-          aws_resource_prefix: peeks
+          aws_resource_prefix: ${{ steps['fetchSystem'].output.entity.spec.resource_prefix }}
           dockerfile_path: ${{parameters.dockerfile_path}}
           deployment_path: ${{parameters.deployment_path}}
           created_by: ${{ (user.entity.spec.profile.displayName | default(user.entity.metadata.name) | default(user.ref) | default("backstage-user")) | replace(" ", "-") }}
@@ -250,7 +251,7 @@ spec:
         url: https://${{ steps['fetchSystem'].output.entity.spec.ingress_hostname }}/argo-workflows/workflows/team-${{ parameters.appname }}
         icon: web
       - title: ECR Main Repository (After Provisioning)
-        url: https://console.aws.amazon.com/ecr/repositories/private/${{ steps['fetchSystem'].output.entity.spec.aws_account_id }}/peeks/${{ parameters.appname }}?region=${{ parameters.aws_region }}
+        url: https://console.aws.amazon.com/ecr/repositories/private/${{ steps['fetchSystem'].output.entity.spec.aws_account_id }}/${{ steps['fetchSystem'].output.entity.spec.resource_prefix }}/${{ parameters.appname }}?region=${{ parameters.aws_region }}
         icon: cloud
       - title: EKS Cluster
         url: https://console.aws.amazon.com/eks/home?region=${{ parameters.aws_region }}#/clusters/${{ parameters.cluster_name }}

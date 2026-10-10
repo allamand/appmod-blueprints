@@ -1,0 +1,254 @@
+# Cluster Providers
+
+This directory contains pluggable cluster provisioning approaches. The addon management
+system (charts, addons, overlays, fleet, bootstrap) is independent of how the hub
+cluster is created.
+
+## Available Providers
+
+| Provider | Description | When to use |
+|----------|-------------|-------------|
+| `kind-crossplane/` | Kind bootstrap + Crossplane provisions the hub EKS cluster (default) | Greenfield, full GitOps, no Terraform |
+| `kind-kro-ack/` | Kind bootstrap + KRO/ACK provisions the hub EKS cluster | Greenfield, full GitOps, KRO/ACK-based provisioning |
+| `terraform/` | Direct Terraform provisioning of the hub EKS cluster (no Kind, no Crossplane) | Teams standardized on Terraform |
+| `byoc/` | Bring Your Own Cluster | Existing cluster, any cloud provider |
+
+The provider is selected via `clusterProvider` in `config.yaml` / `config.local.yaml` and driven
+through the root `Taskfile.yaml` (`task install` / `task status` / `task destroy`).
+
+## The Contract
+
+Any provider must produce a running hub cluster that satisfies the conditions below. Once met, the addon management system takes over — the provider's job is done.
+
+### Inputs
+
+| Source | Fields | Purpose |
+|--------|--------|---------|
+| `config.yaml` | `hub.clusterName`, `aws.region`, `aws.accountId` | Cluster identity |
+| `config.yaml` | `repo.url`, `repo.revision`, `repo.basepath` | Git source for ArgoCD |
+| `config.yaml` | `domain`, `resourcePrefix`, `ingressName` | Ingress and naming |
+| `config.yaml` | `identityCenter.*`, `argocdCapability.*` | EKS ArgoCD Capability setup |
+| `addons/registry/core.yaml` | `argocd.defaultVersion`, `external-secrets.defaultVersion` | Versions (no hardcoding) |
+| AWS credentials | IAM permissions | EKS, VPC, IAM, Secrets Manager, Pod Identity |
+| `bootstrap/root-appset.yaml` | ApplicationSet manifest | Applied as the final step |
+
+### Outputs
+
+When bootstrap completes, the following must exist:
+
+#### AWS Resources
+
+| Resource | Details |
+|----------|---------|
+| EKS cluster | Running, accessible via ARN |
+| VPC + subnets | Networking for the cluster |
+| IAM roles | ArgoCD capability role, ESO pod identity role, Crossplane pod identity role |
+| Pod identity associations | ESO and Crossplane mapped to their IAM roles |
+| Secrets Manager `<cluster>/config` | Cluster metadata: repo URLs, region, account ID, domain, ingress config |
+
+#### Hub Cluster Resources
+
+| Resource | Namespace | Details |
+|----------|-----------|---------|
+| ArgoCD | (managed) | EKS ArgoCD Capability running — no pods in `argocd` namespace |
+| External Secrets Operator | `external-secrets` | Installed via Helm before ArgoCD can manage it (chicken-and-egg) |
+| ClusterSecretStore `aws-secrets-manager` | cluster-scoped | ESO can read from Secrets Manager |
+| Seed cluster secret `<cluster>` | `argocd` | See below |
+| `root-appset.yaml` | `argocd` | Bootstrap ApplicationSet applied |
+
+#### Seed Cluster Secret
+
+The seed secret is intentionally minimal — just enough for the bootstrap ApplicationSet to target the hub. The fleet-secret chart enriches it later.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <clusterName>
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+    fleet_member: control-plane
+    environment: control-plane
+  annotations:
+    addonsRepoURL: <repo.url>
+    addonsRepoRevision: <repo.revision>
+    addonsRepoBasepath: <repo.basepath>
+    fleetRepoURL: <repo.url>
+    fleetRepoRevision: <repo.revision>
+    fleetRepoBasepath: <repo.basepath>
+stringData:
+  name: <clusterName>
+  server: <clusterARN>
+  config: '{"tlsClientConfig":{"insecure":false}}'
+```
+
+What the seed secret does NOT have (added later by fleet-secret chart via ExternalSecret):
+- `enable_*` labels (from `enabled-addons.yaml`)
+- `tenant` label (from `fleet/members/<cluster>/values.yaml`)
+- `aws_cluster_name`, `aws_region`, `ingress_domain_name`, `resource_prefix` annotations (from Secrets Manager `<cluster>/config`)
+
+### Addon Secrets
+
+Some addons require pre-seeded secrets in Secrets Manager. These are not part of the core contract — they are conditional on which addons are enabled in `enabled-addons.yaml`. If an addon is enabled and its chart expects a Secrets Manager entry, the provider must seed it during bootstrap.
+
+| Addon | Secret Key | Required Properties | Purpose |
+|-------|-----------|---------------------|---------|
+| keycloak | `<cluster>/keycloak` | `keycloak_admin_password`, `keycloak_postgres_password`, `user_password` | Keycloak admin, database, and default user passwords |
+
+Each addon's chart documents which Secrets Manager keys it expects — see the comment block at the top of the chart's secret template (e.g., `addons/charts/keycloak/templates/secret-gen.yaml`).
+
+Providers should generate strong random passwords during bootstrap. The `kind-crossplane` provider does this in the `secrets-manager:seed-keycloak` task.
+
+### The Handoff
+
+Once `root-appset.yaml` is applied, ArgoCD takes over:
+
+```
+root-appset.yaml applied
+  -> ArgoCD syncs bootstrap/
+       -> addons.yaml       — renders appset-chart -> one ApplicationSet per addon
+       -> fleet-secrets.yaml — discovers fleet/members/ -> fleet-secret chart enriches seed secret
+       -> clusters.yaml     — KRO cluster provisioning (no-op until fleet members defined)
+```
+
+The fleet-secret chart reads `fleet/members/<cluster>/values.yaml` and `enabled-addons.yaml`, pulls full config from `<cluster>/config` in Secrets Manager, and overwrites the seed secret with the complete set of labels and annotations. From this point, addon ApplicationSets match clusters via `enable_*` labels and the system is fully self-managing.
+
+The bootstrap cluster (Kind) is now disposable — `task destroy-kind` removes it.
+
+### Taskfile Interface
+
+The root `gitops/Taskfile.yaml` delegates to providers by name. Each provider
+must expose these tasks in its `Taskfile.yaml`:
+
+| Task | Required | Description |
+|------|----------|-------------|
+| `install` | Yes | Full bootstrap: create cluster, install ArgoCD, apply root-appset |
+| `status` | Yes | Show current state of cluster, apps, and managed resources |
+| `destroy` | Yes | Full teardown: remove cluster and clean up all resources |
+| `destroy-kind` | No | Remove ephemeral bootstrap cluster only (hub persists) |
+| `hub:update` | No | Update hub infrastructure without full reinstall |
+| `init` | No | Verify prerequisites (CLIs, credentials, config) |
+
+The root Taskfile calls these as `<provider-name>:install`, etc.
+
+### Domain handling (required behaviour)
+
+A provider reads `domain` from config and must **fail rather than install with an empty
+one** — an empty domain silently misconfigures Keycloak realm URLs, the OIDC issuer and
+every ingress host. The domain is a static config value; providers do not resolve, discover,
+or wait for it.
+
+Consumers without a registered domain reserve a free CloudFront hostname before installing
+(`scripts/cloudfront-reserve-domain.sh`, then `scripts/cloudfront-attach-origin.sh`
+afterwards). That is entirely outside the provider: it produces an ordinary `domain` value,
+so no provider needs CloudFront-specific code. See
+[docs/platform/cloudfront-exposure.md](../docs/platform/cloudfront-exposure.md).
+
+### Capability parity (binding)
+
+Providers are interchangeable behind one `config.yaml`, so **a capability added to one
+provider must be added to all of them**. Where that is not yet true, the lacking provider
+must **fail fast** with a clear message rather than silently ignore the input — a silently
+ignored field means `config.local.yaml` means different things depending on
+`clusterProvider`.
+
+Current known gap: `kind-crossplane` cannot provision the hub into a pre-existing VPC, so it
+rejects `hub.network.vpcId` in pre-flight
+([#833](https://github.com/aws-samples/appmod-blueprints/issues/833)). `kind-kro-ack`
+supports it. This does not affect CloudFront exposure, which needs no pre-existing VPC.
+
+### Cluster naming (arbitrary, with two real limits)
+
+Cluster names are **customer-supplied and arbitrary**. Nothing derives them from, or
+validates them against, `resourcePrefix`: `oap-dev`, `team-a` and `sandbox` are all valid
+spoke names. The prefix exists only to scope account/region-global AWS resource names (IAM
+roles, AMP/AMG workspaces, security groups, ECR) so parallel installs do not collide.
+
+Authorization and teardown therefore key on something other than the name:
+
+- **IAM** grants are scoped by the service a role is passed to (`iam:PassedToService`) and,
+  for the cluster-mgmt trust policy, by the platform-specific role suffix. They are **not**
+  scoped by a `<resourcePrefix>-spoke-*` name pattern. That pattern previously denied any
+  non-conforming spoke at `CreateCluster`, after its VPC and NAT gateway already existed.
+- **Teardown** is the remaining gap. Both providers now stamp
+  `platform.gitops.io/prefix` and `platform.gitops.io/cluster` on the cluster and VPC, but
+  the sweep invoked by `task destroy` (`scripts/sweep-spoke-vpcs.py`, step 6h) still selects
+  two literal VPC names, so a spoke named anything else is left behind. Selecting on those
+  tags instead is tracked separately.
+
+Two limits are real and are enforced at declaration time by a Helm `fail` in the chart that
+renders the cluster, so an invalid name creates nothing at all:
+
+| Limit | Why |
+| ----- | --- |
+| DNS-1123 label (lowercase alphanumeric and `-`, starting and ending alphanumeric) | The name is used verbatim as a Kubernetes namespace by the resource graphs. EKS itself would accept uppercase and `_`; the namespace will not. |
+| Length ≤ 34 (`kind-kro-ack`) or ≤ 44 (`kind-crossplane`) | Every IAM role is `<name><suffix>` and IAM caps role names at 64 characters. The longest suffix is `-cloudwatch-observability-role` (30) on the kro path and `-kro-capability-role` (20) on the crossplane path. |
+
+When adding a resource to a provider or resource graph, scope its authorization and its
+cleanup by tag or by service, never by a name pattern.
+
+### Configuration
+
+Providers read shared configuration from `gitops/config.yaml`:
+
+| Field | Description |
+|-------|-------------|
+| `clusterProvider` | Which provider to use (matches directory name) |
+| `repo.url` | Git repository URL |
+| `repo.revision` | Branch or tag |
+| `repo.basepath` | Path prefix in the repo |
+| `hub.clusterName` | Hub cluster name |
+| `hub.kubernetesVersion` | Kubernetes version |
+| `hub.network.vpcId`, `hub.network.subnetIds` | Optional: install into an existing VPC instead of creating one. Only `subnetIds[0]` and `[1]` are read. `kind-kro-ack` only; `kind-crossplane` fails fast (see Capability parity above) |
+| `aws.region` | AWS region |
+| `aws.accountId` | AWS account ID |
+| `domain` | Ingress hostname. Must be known before install (see Domain handling above) |
+| `insecure` | ALB serves plain HTTP because TLS is terminated upstream (e.g. CloudFront). Also makes the platform ALB `internal` and names it `<clusterName>-platform` |
+| `identityCenter.*` | AWS Identity Center config (for EKS ArgoCD Capability) |
+| `argocdCapability.*` | ArgoCD capability config |
+
+Provider-specific config (e.g., Kind node count, VPC CIDR) can live in the
+provider's own directory but should not duplicate values from `config.yaml`.
+
+### AWS credential resolution (EC2 vs local) — kubectl implications
+
+The provider Taskfiles export `AWS_PROFILE` (from `aws.profile`, default `"default"`)
+to every `aws`/`kubectl`/`helm` call so local multi-account users get consistent
+credential targeting. On an EC2 instance authenticated by an **instance role**,
+there is usually no `[default]` profile in `~/.aws/config`, so a bare
+`AWS_PROFILE=default` fails (`config profile (default) could not be found`) and the
+credential chain never falls through to IMDS.
+
+To keep `AWS_PROFILE` flowing while still resolving on EC2, the Taskfiles set
+`AWS_CONFIG_FILE`: on an EC2 host they generate `private/aws-config` containing
+`[default]\ncredential_source = Ec2InstanceMetadata` and point `AWS_CONFIG_FILE`
+at it; off-instance they fall back to the user's existing `AWS_CONFIG_FILE` or
+`~/.aws/config` (unchanged behavior).
+
+> **⚠️ kubectl outside `task` on EC2.** `aws eks update-kubeconfig` bakes the
+> active `AWS_PROFILE` (`default`) into the kubeconfig's exec block. That profile
+> only resolves when `AWS_CONFIG_FILE` points at the generated config — which the
+> Taskfiles set, but your interactive shell does not. So `kubectl` run directly
+> (outside `task`) on an EC2 host will fail with
+> `config profile (default) could not be found` / `exec: executable aws failed`.
+> Fix with **either**:
+> - export the generated config for your shell:
+>   `export AWS_CONFIG_FILE=<repo>/.platform/private/aws-config`, **or**
+> - regenerate the kubeconfig without a profile so it uses the instance role:
+>   `env -u AWS_PROFILE aws eks update-kubeconfig --name <hub> --region <region>`
+
+## Adding a New Provider
+
+1. Create a directory under `cluster-providers/` matching the provider name
+2. Add a `Taskfile.yaml` exposing at minimum: `install`, `status`, `destroy`
+3. Add a `README.md` explaining the approach
+4. Register the include in `gitops/Taskfile.yaml`:
+   ```yaml
+   includes:
+     my-provider:
+       taskfile: ./cluster-providers/my-provider/Taskfile.yaml
+       dir: ./cluster-providers/my-provider
+       optional: true
+   ```
+5. Set `clusterProvider: "my-provider"` in `config.yaml` to use it

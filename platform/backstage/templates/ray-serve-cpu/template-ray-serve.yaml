@@ -183,12 +183,15 @@ spec:
               backstage.io/created-by: ${{ (user.entity.spec.profile.displayName | default(user.entity.metadata.name) | default(user.ref) | default("backstage-user")) | replace(" ", "-") }}
           spec:
             destinations:
-              - name: peeks-hub
+              - name: ${{ steps['fetchSystem'].output.entity.spec.hub_cluster_name }}
                 namespace: ${{ parameters.namespace }}
             sourceRepos:
               - https://${{ steps['fetchSystem'].output.entity.spec.gitlab_hostname }}/${{ steps['fetchSystem'].output.entity.spec.gituser }}/${{parameters.name}}-ray-service.git
             sourceNamespaces:
               - argocd
+            clusterResourceWhitelist:
+              - group: ""
+                kind: PersistentVolume
             namespaceResourceWhitelist:
               - group: ""
                 kind: Namespace
@@ -198,6 +201,8 @@ spec:
                 kind: ConfigMap
               - group: ""
                 kind: Secret
+              - group: ""
+                kind: PersistentVolumeClaim
               - group: apps
                 kind: Deployment
               - group: kro.run
@@ -208,6 +213,8 @@ spec:
                 kind: RayCluster
               - group: networking.k8s.io
                 kind: Ingress
+              - group: policy
+                kind: PodDisruptionBudget
             roles:
               - name: admin
                 policies:
@@ -250,7 +257,7 @@ spec:
               path: manifests
               targetRevision: HEAD
             destination:
-              name: peeks-hub
+              name: ${{ steps['fetchSystem'].output.entity.spec.hub_cluster_name }}
               namespace: ${{ parameters.namespace }}
             syncPolicy:
               automated:
@@ -329,7 +336,7 @@ spec:
         url: https://${{ steps['fetchSystem'].output.entity.spec.gitlab_hostname }}/${{ steps['fetchSystem'].output.entity.spec.gituser }}/${{ parameters.name }}-ray-service
         icon: git
       - title: ArgoCD Project
-        url: https://${{ steps['fetchSystem'].output.entity.spec.argocd_hostname }}/settings/argocd/projects/${{ parameters.name }}-ray-project
+        url: https://${{ steps['fetchSystem'].output.entity.spec.argocd_hostname }}/settings/projects/${{ parameters.name }}-ray-project
         icon: web
       - title: Ray Serve Endpoint (After Deployment)
         url: https://${{ steps['fetchSystem'].output.entity.spec.ingress_hostname }}/ray-serve/${{ parameters.name }}/

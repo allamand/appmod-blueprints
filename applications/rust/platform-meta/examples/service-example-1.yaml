@@ -5,17 +5,16 @@ metadata:
 spec:
   components:
     - name: msvc-1-example
-      type: appmod-service
+      type: service-rollout
       properties:
         image:  929819487611.dkr.ecr.us-west-2.amazonaws.com/modernengg/msvc-1:latest
-        image_name: msvc-1
         port: 80
         targetPort: 80
         replicas: 1
       traits:
         - type: path-based-ingress
           properties:
-            domain: "*.elb.us-west-2.amazonaws.com"
+            domain: ""
             rewritePath: true
             http:
               /northwind-app: 80

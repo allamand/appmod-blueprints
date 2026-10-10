@@ -1,0 +1,87 @@
+# Mode: "externalSecret" (hub) or "direct" (spokes)
+mode: "direct"
+
+# Common fields
+clusterName: ""
+region: ""
+labels: {}
+
+# External Secret mode (hub only)
+externalSecret:
+  enabled: false
+  creationPolicy: Owner
+  secretStoreRefKind: ClusterSecretStore
+  secretStoreRefName: aws-secrets-manager
+
+# Direct mode fields — populated from hub cluster secret annotations
+hub:
+  clusterName: ""
+  accountId: ""
+  addonsRepoURL: ""
+  addonsRepoRevision: ""
+  addonsRepoBasepath: ""
+  fleetRepoURL: ""
+  fleetRepoRevision: ""
+  fleetRepoBasepath: ""
+  domain: ""
+  resourcePrefix: ""
+  # Platform-wide AWS tags as a compact JSON object STRING (e.g. '{"auto-delete":"no"}'),
+  # populated from the hub cluster-secret `platform_tags` annotation. Rendered verbatim
+  # as the spoke's own `platform_tags` annotation. Empty -> annotation omitted.
+  platformTags: ""
+  # platform IngressClass controller mode: "oss" (AWS LBC, ingress.k8s.aws/alb) or
+  # "auto" (EKS Auto Mode, eks.amazonaws.com/alb). Spokes default to "oss" so the
+  # platform class is always the OSS LBC (required for transforms/URL-rewrite).
+  albControllerMode: "oss"
+
+# External overlay repo ("layer 5") — OPTIONAL, default OFF.
+#
+# Set repoURL to a CONSUMER repo to let it override Helm values for addons whose
+# chart + registry entry live in THIS repo, without editing this repo. Rendered as
+# the overlay_repo_* cluster-secret annotations, which bootstrap/addons.yaml feeds
+# to the appset-chart as overlayRepoURLGit* — that appends a $overlay source and,
+# per addon, three extra valueFiles that layer AFTER the in-repo ones.
+# See README.md § External overlay repo for the full walkthrough.
+#
+# WARNING: when set, $overlay becomes a REAL ArgoCD source for every overlay-aware
+# app on that cluster — an unreachable or unauthenticated repo breaks all of them.
+# Leave empty unless ArgoCD can already read the repo.
+overlay:
+  repoURL: ""
+  # MUST be a revision that actually contains the overlay files. Empty means "use
+  # useFleetRepo's inherited value if set, else main" — see useFleetRepo below.
+  revision: ""
+  # Repo-relative root holding configs/ + overlays/ (e.g. "gitops/"). Falls back to
+  # addonsRepoBasepath when empty.
+  basepath: ""
+  # A consumer that passes its OWN repo as both the fleet repo (spoke discovery,
+  # gitops/fleet/spoke-values/...) and its overlay repo (addon value overrides)
+  # previously had to write that repo's URL and revision twice: once implicitly via
+  # hub.fleetRepoURL/hub.fleetRepoRevision (from its own install config), and again
+  # explicitly here. Nothing kept the two in sync, and a stale/wrong copy here fails
+  # SILENTLY: bootstrap/clusters-kro.yaml's git generator resolves discovery as
+  # `or overlay_repo_url fleetRepoURL`, so a wrong-but-non-empty overlay URL globs a
+  # valid tree that simply has no spoke JSON files in it, and zero spoke
+  # Applications are generated with no error anywhere.
+  #
+  # Set useFleetRepo: true to inherit hub.fleetRepoURL/hub.fleetRepoRevision instead
+  # of repeating them. An explicit repoURL/revision above still wins, so a genuinely
+  # separate overlay repo is unaffected.
+  useFleetRepo: false
+
+# Addon enablement map — populated from enabled-addons.yaml via valueFiles
+enabledAddons: {}
+
+# OIDC configuration — used to derive oidc_issuer_url on spoke cluster secrets.
+# issuerUrlTemplate is a Go template evaluated with:
+#   .domain      = hub.domain (ingress_domain_name)
+#   .environment = labels.environment from the fleet-member values file
+#   .realm       = oidc.realm (below)
+# The issuer realm MUST match the realm where the client is created by the
+# client-provisioner. Both default to the shared "platform" realm.
+# Customers override .realm per hub/spoke via the fleet-member values
+# (oidc.realm), or swap issuerUrlTemplate entirely for an external IdP.
+oidc:
+  realm: "platform"
+  issuerUrlTemplate: "https://{{ .domain }}/keycloak/realms/{{ .realm }}"
+  insecureOrigin: "false"

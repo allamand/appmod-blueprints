@@ -1,0 +1,28 @@
+{{- if and .Values.amg.enabled .Values.aws.vpcId .Values.amg.subnetIds }}
+apiVersion: kro.run/v1alpha1
+kind: GrafanaWorkspaceWithVpc
+metadata:
+  name: {{ .Values.resourcePrefix }}-amg
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  resourcePrefix: {{ .Values.resourcePrefix }}
+  region: {{ .Values.aws.region }}
+  vpcId: {{ .Values.aws.vpcId }}
+  workspaceName: {{ .Values.amg.name | default (printf "%s-observability" .Values.resourcePrefix) }}
+  roleArnRefName: {{ .Values.resourcePrefix }}-amg-workspace-role
+  grafanaVersion: {{ .Values.amg.grafanaVersion | quote }}
+  subnetIds:
+    {{- if kindIs "string" .Values.amg.subnetIds }}
+    {{- range (splitList "," .Values.amg.subnetIds) }}
+    - {{ . | trim }}
+    {{- end }}
+    {{- else }}
+    {{- toYaml .Values.amg.subnetIds | nindent 4 }}
+    {{- end }}
+  dataSources:
+    {{- toYaml .Values.amg.dataSources | nindent 4 }}
+  notificationDestinations:
+    {{- toYaml .Values.amg.notificationDestinations | nindent 4 }}
+{{- end }}

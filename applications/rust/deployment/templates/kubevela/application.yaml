@@ -7,24 +7,24 @@ metadata:
 spec:
   components:
     - name: rust-microservice
-      type: appmod-service
-      dependsOn:
-        - rust-service-account-<environment>
+      type: service-rollout
       properties:
         image: <image>
-        image_name: rust-app
         port: 8080
         targetPort: 8080
         replicas: 2
+        # appPath drives APP_BASE_PATH (image URL prefix); keep it EQUAL to the
+        # path-based-ingress trait path below, else prefixed assets 404.
         appPath: "/rust-app"
-        serviceAccount: rust-service-account-<environment>
         env:
           - name: APP_ENV
             value: "DEV"
           - name: TABLE_NAME
-            value: rust-app-table-<environment>
-          - name: AWS_REGION
-            value: "${AWS_REGION}"
+            value: ${RESOURCE_PREFIX}-rust-app-table-<environment>
+          # NOTE: AWS_REGION is deliberately NOT set here. The aws-service-identity
+          # trait injects it (and AWS_DEFAULT_REGION) from platform config, so the
+          # same manifest deploys unchanged to any region. Setting it here would
+          # also collide with the trait's container patch.
         readinessProbe:
           httpGet:
             path: /collection/FRONT_PAGE
@@ -39,25 +39,29 @@ spec:
           limits:
             memory: "512Mi"
       traits:
+        # Grants this workload an AWS IAM identity via EKS Pod Identity and attaches
+        # the DynamoDB component's policy to it. Zero parameters beyond accessFor:
+        # the ServiceAccount is the component's own (same name), and cluster/region
+        # are resolved by the platform, not declared here.
+        - type: aws-service-identity
+          properties:
+            accessFor:
+              - rust-dynamodb-<environment>
         - type: path-based-ingress
           properties:
-            domain: "*.elb.us-west-2.amazonaws.com"
+            domain: ""
             rewritePath: true
+            # The Rust app only serves 2xx under /collection/*, so the ALB target
+            # health check must target a served path (default "/" returns 404 →
+            # unhealthy targets on the OSS LBC). Uses the healthcheckPath trait param.
+            healthcheckPath: /collection/FRONT_PAGE
             http:
-              /rust-app: 8080
-
-    - name: rust-service-account-<environment>
-      type: dp-service-account
-      properties:
-        componentNamesForAccess:
-          - rust-dynamodb-<environment>
-        clusterName: peeks-spoke-dev
-        clusterRegion: us-west-2
+              /rust-app: 8080  # keep in sync with appPath above
 
     - name: rust-dynamodb-<environment>
       type: dynamodb-table
       properties:
-        tableName: rust-app-table-<environment>
+        tableName: ${RESOURCE_PREFIX}-rust-app-table-<environment>
         partitionKeyName: partition_key
         sortKeyName: sort_key
         region: us-west-2
